@@ -282,8 +282,8 @@ app.post('/api/verify-vip', async (req, res) => {
 // ============================================
 // DÉMARRAGE
 // ============================================
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, ...);
     console.log(`🚀 Serveur TRINQ démarré sur le port ${PORT}`);
     console.log(`📋 Variables d'env détectées :`);
     console.log(`   - SUPABASE_URL: ${process.env.SUPABASE_URL ? '✅' : '❌ MANQUANTE'}`);
