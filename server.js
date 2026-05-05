@@ -181,5 +181,53 @@ app.post('/api/verify-vip', async (req, res) => {
     }
 });
 
+// --- AUTHENTIFICATION UNIQUE (MAGIC CODE) ---
+app.post('/api/auth', async (req, res) => {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ success: false, message: 'Email requis.' });
+    try {
+        let { data: user } = await supabase.from('users').select('id').eq('email', email).single();
+        const code = Math.floor(100000 + Math.random() * 900000).toString();
+        const expires = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+        if (!user) await supabase.from('users').insert({ email, login_code: code, login_code_expires: expires });
+        else await supabase.from('users').update({ login_code: code, login_code_expires: expires }).eq('email', email);
+
+        await resend.emails.send({
+            from: 'TRINQ <onboarding@resend.dev>',
+            to: email, // Doit être ton email si Resend non validé
+            subject: 'Code Connexion TRINQ 🍺',
+            html: `<h2>Connexion TRINQ</h2><p>Ton code secret : <strong style="font-size:32px;">${code}</strong></p>`
+        });
+        res.json({ success: true, message: 'Code envoyé !' });
+    } catch (err) { res.status(500).json({ success: false }); }
+});
+
+// --- SET USERNAME ---
+app.post('/api/set-username', async (req, res) => {
+    const { email, username } = req.body;
+    try {
+        await supabase.from('users').update({ username }).eq('email', email);
+        res.json({ success: true, username });
+    } catch (err) { res.status(500).json({ success: false }); }
+});
+
+// --- LEADERBOARD ---
+app.get('/api/leaderboard', async (req, res) => {
+    try {
+        const { data } = await supabase.from('users').select('username, score, is_vip').not('username', 'is', null).order('score', { ascending: false }).limit(10);
+        res.json({ success: true, leaderboard: data });
+    } catch (err) { res.status(500).json({ success: false }); }
+});
+
+// --- AJOUTER DES POINTS ---
+app.post('/api/add-score', async (req, res) => {
+    const { email, points } = req.body;
+    try {
+        const { data } = await supabase.from('users').select('score').eq('email', email).single();
+        if (data) await supabase.from('users').update({ score: (data.score || 0) + points }).eq('email', email);
+        res.json({ success: true });
+    } catch (err) { res.status(500).json({ success: false }); }
+});
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Serveur TRINQ démarré sur le port ${PORT}`));
