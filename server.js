@@ -198,22 +198,38 @@ app.post('/api/verify-vip', async (req, res) => {
 app.post('/api/auth', async (req, res) => {
     const { email } = req.body;
     if (!email) return res.status(400).json({ success: false, message: 'Email requis.' });
+    
     try {
-        let { data: user } = await supabase.from('users').select('id').eq('email', email).single();
+        const safeEmail = email.toLowerCase().trim();
         const code = Math.floor(100000 + Math.random() * 900000).toString();
         const expires = new Date(Date.now() + 15 * 60 * 1000).toISOString();
 
-        if (!user) await supabase.from('users').insert({ email, login_code: code, login_code_expires: expires });
-        else await supabase.from('users').update({ login_code: code, login_code_expires: expires }).eq('email', email);
+        // 1. Chercher si l'utilisateur existe
+        let { data: user, error: searchError } = await supabase.from('users').select('id').eq('email', safeEmail).maybeSingle();
+        if (searchError) throw searchError;
 
+        // 2. Créer OU Mettre à jour (avec blocage si la base de données refuse !)
+        if (!user) {
+            const { error: insertError } = await supabase.from('users').insert([{ email: safeEmail, login_code: code, login_code_expires: expires }]);
+            if (insertError) throw insertError; // CRUCIAL : Stoppe tout si Supabase refuse
+        } else {
+            const { error: updateError } = await supabase.from('users').update({ login_code: code, login_code_expires: expires }).eq('email', safeEmail);
+            if (updateError) throw updateError;
+        }
+
+        // 3. Envoyer l'email SEULEMENT SI la base de données a bien enregistré le code
         await resend.emails.send({
             from: 'TRINQ <onboarding@resend.dev>',
-            to: email, // Doit être ton email si Resend non validé
+            to: safeEmail, 
             subject: 'Code Connexion TRINQ 🍺',
             html: `<h2>Connexion TRINQ</h2><p>Ton code secret : <strong style="font-size:32px;">${code}</strong></p>`
         });
+        
         res.json({ success: true, message: 'Code envoyé !' });
-    } catch (err) { res.status(500).json({ success: false }); }
+    } catch (err) { 
+        console.error("Erreur serveur auth:", err);
+        res.status(500).json({ success: false, message: "Erreur Base de données. Vérifie Railway !" }); 
+    }
 });
 
 // --- SET USERNAME ---
