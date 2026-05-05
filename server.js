@@ -124,23 +124,36 @@ app.post('/api/login', async (req, res) => {
 });
 
 // --- VÉRIFICATION DU CODE A 6 CHIFFRES ---
+// --- VERIFICATION DU CODE ---
 app.post('/api/verify-login', async (req, res) => {
     const { email, code } = req.body;
-    if (!email || !code) return res.status(400).json({ success: false, message: 'Données manquantes.' });
-
     try {
-        const { data: user } = await supabase.from('users').select('*').eq('email', email).eq('login_code', code).single();
+        const safeEmail = email.toLowerCase().trim();
+        const safeCode = code.trim();
 
-        if (!user) return res.status(401).json({ success: false, message: 'Code incorrect.' });
-        if (new Date(user.login_code_expires) < new Date()) return res.status(401).json({ success: false, message: 'Code expiré. Recommence.' });
+        // 1. On cherche SEULEMENT par email pour être sûr de trouver le compte
+        const { data: user, error } = await supabase.from('users').select('*').eq('email', safeEmail).maybeSingle();
+        
+        if (error) console.error("Erreur DB:", error);
+        if (!user) return res.status(401).json({ success: false, message: 'Compte introuvable.' });
 
-        // Invalide le code après utilisation
-        await supabase.from('users').update({ login_code: null, login_code_expires: null }).eq('email', email);
+        // 2. On compare les codes en forçant le format texte (sécurité anti-bug Supabase)
+        if (String(user.login_code) !== String(safeCode)) {
+            return res.status(401).json({ success: false, message: 'Code incorrect.' });
+        }
 
-        res.json({ success: true, message: 'Connecté !', user: { id: user.id, email: user.email, is_vip: user.is_vip } });
-    } catch (err) {
-        console.error("Erreur verify-login:", err);
-        res.status(500).json({ success: false, message: 'Erreur serveur.' });
+        // 3. On vérifie l'expiration
+        if (new Date(user.login_code_expires) < new Date()) {
+            return res.status(401).json({ success: false, message: 'Code expiré (plus de 15 min).' });
+        }
+
+        // 4. Tout est bon, on efface le code pour la sécurité
+        await supabase.from('users').update({ login_code: null, login_code_expires: null }).eq('email', safeEmail);
+        
+        res.json({ success: true, user: { email: user.email, is_vip: user.is_vip, username: user.username, score: user.score } });
+    } catch (err) { 
+        console.error("Erreur serveur verify-login:", err);
+        res.status(500).json({ success: false, message: 'Erreur interne.' }); 
     }
 });
 
