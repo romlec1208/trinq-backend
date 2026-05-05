@@ -97,6 +97,49 @@ app.post('/api/create-checkout-session', async (req, res) => {
     }
 });
 
+// --- ROUTE POUR VÉRIFIER ET ACTIVER LE CODE VIP ---
+app.post('/api/verify-vip', async (req, res) => {
+    const { code } = req.body;
+    
+    if (!code) {
+        return res.status(400).json({ success: false, message: "Aucun code fourni." });
+    }
+
+    try {
+        // 1. Chercher le code dans la base de données
+        const { data, error } = await supabase
+            .from('vip_codes')
+            .select('*')
+            .eq('code', code)
+            .single();
+
+        // 2. Vérifications
+        if (error || !data) {
+            return res.status(404).json({ success: false, message: "Code invalide ou introuvable." });
+        }
+        if (data.status === 'active') {
+            return res.status(400).json({ success: false, message: "Ce code a déjà été utilisé sur un autre appareil." });
+        }
+        if (data.status === 'revoked') {
+            return res.status(400).json({ success: false, message: "Ce code a été révoqué (remboursement)." });
+        }
+
+        // 3. Si tout est bon, on l'active !
+        const { error: updateError } = await supabase
+            .from('vip_codes')
+            .update({ status: 'active' })
+            .eq('code', code);
+
+        if (updateError) throw updateError;
+
+        res.json({ success: true, message: "Pass VIP activé avec succès ! Bienvenue !" });
+
+    } catch (err) {
+        console.error("Erreur vérification VIP :", err);
+        res.status(500).json({ success: false, message: "Erreur du serveur." });
+    }
+});
+
 const PORT = 3000;
 app.listen(PORT, () => {
     console.log(`🚀 Serveur TRINQ démarré sur http://localhost:${PORT}`);
