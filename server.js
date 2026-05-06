@@ -304,8 +304,43 @@ app.get('/api/debug-db', async (req, res) => {
     res.json(data);
 });
 
+app.post('/api/auth', async (req, res) => {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ success: false, message: 'Email requis' });
+
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+
+    console.log("🔵 /api/auth appelé pour :", email);
+    console.log("🔵 Code généré :", code);
+    console.log("🔵 Resend initialisé ?", resend ? "OUI" : "NON");
+
+    const { data: existingUser } = await supabase.from('users').select('email').eq('email', email).single();
+    if (!existingUser) {
+        await supabase.from('users').insert([{ email, score: 0, is_vip: false }]);
+    }
+
+    await supabase.from('users').update({ auth_code: code, auth_expires: expiresAt }).eq('email', email);
+
+    try {
+        console.log("📧 ENVOI EMAIL À :", email);
+        const response = await resend.emails.send({
+            from: 'TRINQ <noreply@trinq.be>',
+            to: email,
+            subject: '🍺 Ton code de connexion TRINQ',
+            html: `<h2>Ton code : <strong>${code}</strong></h2><p>Valable 10 minutes.</p>`
+        });
+        console.log("✅ RÉPONSE RESEND :", response);
+        res.json({ success: true });
+    } catch (e) {
+        console.error("❌ ERREUR RESEND :", e.message, e);
+        res.status(500).json({ success: false, message: 'Erreur envoi email: ' + e.message });
+    }
+});
+
 /* =========================================
    DÉMARRAGE
    ========================================= */
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`🚀 TRINQ backend running on port ${PORT}`));
+
