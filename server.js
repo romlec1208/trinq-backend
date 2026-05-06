@@ -8,6 +8,15 @@ const cors = require('cors');
 const crypto = require('crypto');
 
 const app = express();
+
+// ⚠️ AJOUTE CES LIGNES :
+app.use((req, res, next) => {
+    console.error("📨 REQUÊTE :", req.method, req.path, req.body);
+    next();
+});
+
+app.use(express.json());
+
 const server = http.createServer(app);
 
 const io = new Server(server, {
@@ -163,6 +172,13 @@ app.use((req, res, next) => {
 /* =========================================
    ROUTES API
    ========================================= */
+console.error("⚠️ ENDPOINT /api/verify-login ENREGISTRÉ");
+
+app.post('/api/verify-login', async (req, res) => {
+    console.error("🔴 /api/verify-login APPELÉ !");
+    const { email, code } = req.body;
+    // ... reste du code
+
 
 app.post('/api/verify-login', async (req, res) => {
     const { email, code } = req.body;
