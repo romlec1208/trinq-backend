@@ -10,16 +10,19 @@ const crypto = require('crypto');
 const app = express();
 const server = http.createServer(app);
 
-const io = new Server(server, {
-    cors: {
-        origin: ['https://trinq.be', 'http://localhost:3000'],
-        methods: ['GET', 'POST']
-    }
-});
+const cors = require('cors');
+app.use(cors({
+    origin: [
+        'https://trinq.be',
+        'https://melodic-creponne-95434f.netlify.app'
+    ]
+}));
+
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const resend = new Resend(process.env.RESEND_API_KEY);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+
 
 app.use(cors({ origin: ['https://trinq.be', 'http://localhost:3000'] }));
 
