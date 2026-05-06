@@ -275,5 +275,23 @@ app.post('/api/add-score', async (req, res) => {
         res.json({ success: true });
     } catch (err) { res.status(500).json({ success: false }); }
 });
+
+// --- CLOUD SYNC UP (Sauvegarder vers Supabase) ---
+app.post('/api/sync-up', async (req, res) => {
+    const { email, history, favorites } = req.body;
+    try {
+        await supabase.from('users').update({ history, favorites }).eq('email', email);
+        res.json({ success: true });
+    } catch (err) { res.status(500).json({ success: false }); }
+});
+
+// --- CLOUD SYNC DOWN (Récupérer depuis Supabase) ---
+app.post('/api/sync-down', async (req, res) => {
+    const { email } = req.body;
+    try {
+        const { data } = await supabase.from('users').select('history, favorites').eq('email', email).maybeSingle();
+        res.json({ success: true, data });
+    } catch (err) { res.status(500).json({ success: false }); }
+});
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Serveur TRINQ démarré sur le port ${PORT}`));
