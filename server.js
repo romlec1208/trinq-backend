@@ -1,297 +1,310 @@
-require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
+const http = require('http');
+const { Server } = require('socket.io');
 const { createClient } = require('@supabase/supabase-js');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const Stripe = require('stripe');
 const { Resend } = require('resend');
+const cors = require('cors');
+const crypto = require('crypto');
 
 const app = express();
+const server = http.createServer(app);
+
+const io = new Server(server, {
+    cors: {
+        origin: ['https://trinq.be', 'http://localhost:3000'],
+        methods: ['GET', 'POST']
+    }
+});
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const resend = new Resend(process.env.RESEND_API_KEY);
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-app.use(cors());
+app.use(cors({ origin: ['https://trinq.be', 'http://localhost:3000'] }));
 
-// 1. STRIPE WEBHOOK (Doit impérativement être AVANT express.json)
-app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-    const sig = req.headers['stripe-signature'];
-    let event;
+/* =========================================
+   ROOMS EN MÉMOIRE
+   ========================================= */
+const rooms = {};
+
+function generateRoomCode() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let code = '';
+    for (let i = 0; i < 4; i++) code += chars[Math.floor(Math.random() * chars.length)];
+    return code;
+}
+
+/* =========================================
+   SOCKET.IO — MULTIJOUEUR
+   ========================================= */
+io.on('connection', (socket) => {
+    console.log('🔌 Connecté:', socket.id);
+
+    // CRÉER UNE ROOM (hôte VIP uniquement)
+    socket.on('create-room', ({ email, username }) => {
+        let code;
+        do { code = generateRoomCode(); } while (rooms[code]);
+
+        rooms[code] = {
+            host: socket.id,
+            hostEmail: email,
+            members: [{ socketId: socket.id, username: username || 'Hôte', email }],
+            drinks: [],
+            currentPlace: null,
+            neverPhrase: null,
+            createdAt: Date.now()
+        };
+
+        socket.join(code);
+        socket.roomCode = code;
+        socket.emit('room-created', { code, room: rooms[code] });
+        console.log(`🏠 Room créée: ${code} par ${email}`);
+    });
+
+    // REJOINDRE UNE ROOM
+    socket.on('join-room', ({ code, username, email }) => {
+        const room = rooms[code];
+        if (!room) {
+            socket.emit('room-error', { message: 'Room introuvable. Vérifie le code.' });
+            return;
+        }
+
+        room.members.push({ socketId: socket.id, username: username || 'Invité', email });
+        socket.join(code);
+        socket.roomCode = code;
+
+        // Envoie l'état actuel au nouveau membre
+        socket.emit('room-joined', { code, room });
+
+        // Prévient tout le monde
+        io.to(code).emit('member-joined', {
+            username: username || 'Invité',
+            members: room.members,
+            drinks: room.drinks
+        });
+
+        console.log(`👤 ${username} a rejoint la room ${code}`);
+    });
+
+    // AJOUTER UNE BOISSON
+    socket.on('add-drink', ({ code, drink }) => {
+        const room = rooms[code];
+        if (!room) return;
+
+        room.drinks.push(drink);
+        io.to(code).emit('drinks-updated', { drinks: room.drinks });
+    });
+
+    // SUPPRIMER UNE BOISSON
+    socket.on('remove-drink', ({ code, index }) => {
+        const room = rooms[code];
+        if (!room) return;
+
+        room.drinks.splice(index, 1);
+        io.to(code).emit('drinks-updated', { drinks: room.drinks });
+    });
+
+    // CHANGER DE LIEU
+    socket.on('update-place', ({ code, place }) => {
+        const room = rooms[code];
+        if (!room) return;
+
+        room.currentPlace = place;
+        io.to(code).emit('place-updated', { place });
+    });
+
+    // ARCHIVER LA TOURNÉE (hôte uniquement)
+    socket.on('archive-round', ({ code, roundData }) => {
+        const room = rooms[code];
+        if (!room || room.host !== socket.id) return;
+
+        room.drinks = [];
+        io.to(code).emit('round-archived', { roundData });
+    });
+
+    // "JE N'AI JAMAIS" — phrase IA partagée
+    socket.on('never-phrase', ({ code, phrase }) => {
+        const room = rooms[code];
+        if (!room) return;
+
+        room.neverPhrase = phrase;
+        io.to(code).emit('never-phrase-broadcast', { phrase });
+    });
+
+    // DÉCONNEXION
+    socket.on('disconnect', () => {
+        const code = socket.roomCode;
+        if (!code || !rooms[code]) return;
+
+        const room = rooms[code];
+        room.members = room.members.filter(m => m.socketId !== socket.id);
+
+        if (room.host === socket.id) {
+            // L'hôte part → ferme la room
+            io.to(code).emit('room-closed', { message: "L'hôte a quitté la soirée." });
+            delete rooms[code];
+            console.log(`❌ Room ${code} fermée (hôte parti)`);
+        } else {
+            io.to(code).emit('member-left', { members: room.members });
+        }
+    });
+});
+
+/* =========================================
+   MIDDLEWARES HTTP
+   ========================================= */
+app.use((req, res, next) => {
+    if (req.originalUrl === '/api/webhook') next();
+    else express.json()(req, res, next);
+});
+
+/* =========================================
+   ROUTES API
+   ========================================= */
+app.post('/api/auth', async (req, res) => {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ success: false, message: 'Email requis' });
+
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+
+    const { data: existingUser } = await supabase.from('users').select('email').eq('email', email).single();
+    if (!existingUser) {
+        await supabase.from('users').insert([{ email, score: 0, is_vip: false }]);
+    }
+
+    await supabase.from('users').update({ auth_code: code, auth_expires: expiresAt }).eq('email', email);
 
     try {
-        event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-    } catch (err) {
-        console.error('Signature invalide:', err.message);
-        return res.status(400).json({ error: err.message });
+        await resend.emails.send({
+            from: 'TRINQ <noreply@trinq.be>',
+            to: email,
+            subject: '🍺 Ton code de connexion TRINQ',
+            html: `<h2>Ton code : <strong>${code}</strong></h2><p>Valable 10 minutes.</p>`
+        });
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ success: false, message: 'Erreur envoi email' });
+    }
+});
+
+app.post('/api/verify-login', async (req, res) => {
+    const { email, code } = req.body;
+    const { data: user } = await supabase.from('users').select('*').eq('email', email).single();
+
+    if (!user || user.auth_code !== code) return res.json({ success: false, message: 'Code incorrect' });
+    if (new Date() > new Date(user.auth_expires)) return res.json({ success: false, message: 'Code expiré' });
+
+    await supabase.from('users').update({ auth_code: null, auth_expires: null }).eq('email', email);
+    res.json({ success: true, user: { email: user.email, username: user.username, score: user.score, is_vip: user.is_vip } });
+});
+
+app.post('/api/verify-vip', async (req, res) => {
+    const { code, email } = req.body;
+    const { data: vipCode } = await supabase.from('vip_codes').select('*').eq('code', code).single();
+
+    if (!vipCode) return res.json({ success: false, message: 'Code invalide' });
+    if (vipCode.used) return res.json({ success: false, message: 'Code déjà utilisé' });
+
+    await supabase.from('vip_codes').update({ used: true, used_by: email, used_at: new Date().toISOString() }).eq('code', code);
+    await supabase.from('users').update({ is_vip: true, vip_code: code }).eq('email', email);
+
+    res.json({ success: true });
+});
+
+app.post('/api/create-checkout-session', async (req, res) => {
+    const { email } = req.body;
+    try {
+        const session = await stripe.checkout.sessions.create({
+            payment_method_types: ['card'],
+            line_items: [{ price_data: { currency: 'eur', product_data: { name: 'TRINQ VIP' }, unit_amount: 500 }, quantity: 1 }],
+            mode: 'payment',
+            customer_email: email || undefined,
+            success_url: 'https://trinq.be/?success=true',
+            cancel_url: 'https://trinq.be/?canceled=true',
+        });
+        res.json({ url: session.url });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+    let event;
+    try {
+        event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], process.env.STRIPE_WEBHOOK_SECRET);
+    } catch (e) {
+        return res.status(400).send(`Webhook Error: ${e.message}`);
     }
 
     if (event.type === 'checkout.session.completed') {
         const session = event.data.object;
-        const customerEmail = session.customer_details?.email;
+        const email = session.customer_email;
 
-        if (customerEmail) {
-            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-            let vipCode = 'TRINQ-';
-            for (let i = 0; i < 4; i++) vipCode += chars.charAt(Math.floor(Math.random() * chars.length));
-            vipCode += '-';
-            for (let i = 0; i < 4; i++) vipCode += chars.charAt(Math.floor(Math.random() * chars.length));
+        const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+        let vipCode = 'TRINQ-';
+        for (let i = 0; i < 4; i++) vipCode += chars[Math.floor(Math.random() * chars.length)];
+        vipCode += '-';
+        for (let i = 0; i < 4; i++) vipCode += chars[Math.floor(Math.random() * chars.length)];
 
-            const { error } = await supabase.from('vip_codes').insert([{ code: vipCode, status: 'pending' }]);
-            if (error) console.error('Erreur Supabase:', error);
+        await supabase.from('vip_codes').insert([{ code: vipCode, used: false, created_for: email }]);
 
-            try {
-                await resend.emails.send({
-                    from: 'TRINQ <onboarding@resend.dev>',
-                    to: customerEmail,
-                    subject: '💎 Ton Pass VIP TRINQ est là !',
-                    html: `<h2>Bienvenue ! 🍻</h2><p>Ton code : <strong>${vipCode}</strong></p>`
-                });
-            } catch (e) {
-                console.error('Erreur email:', e);
-            }
-        }
-    }
-    res.status(200).json({ received: true });
-});
-
-// 2. PARSER JSON (Pour toutes les autres routes : Auth, VIP, etc.)
-app.use(express.json());
-
-app.get('/', (req, res) => res.json({ status: 'ok', message: 'Serveur TRINQ 🍻' }));
-
-// --- CREATION DE COMPTE (INSCRIPTION) ---
-app.post('/api/register', async (req, res) => {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ success: false, message: 'Email requis.' });
-
-    try {
-        // Vérifie si déjà inscrit
-        const { data: existing } = await supabase.from('users').select('id').eq('email', email).single();
-        if (existing) return res.status(400).json({ success: false, message: 'Email déjà utilisé.' });
-
-        // Génère un code à 6 chiffres
-        const code = Math.floor(100000 + Math.random() * 900000).toString();
-        const expires = new Date(Date.now() + 15 * 60 * 1000).toISOString(); // Expire dans 15 min
-
-        // Crée l'utilisateur
-        const { error } = await supabase.from('users').insert({
-            email,
-            login_code: code,
-            login_code_expires: expires
-        });
-
-        if (error) throw error;
-
-        // Envoie le code par email
-        await resend.emails.send({
-            from: 'TRINQ <onboarding@resend.dev>',
-            to: email, // ⚠️ DOIT ÊTRE TON EMAIL POUR QUE ÇA MARCHE EN MODE TEST
-            subject: 'Ton code de connexion TRINQ 🍺',
-            html: `<h2>Bienvenue sur TRINQ !</h2><p>Ton code : <strong style="font-size:32px;">${code}</strong></p><p>Valable 15 minutes.</p>`
-        });
-
-        res.json({ success: true, message: 'Code envoyé par email !' });
-    } catch (err) {
-        console.error("Erreur register:", err);
-        res.status(500).json({ success: false, message: 'Erreur lors de l\'inscription.' });
-    }
-});
-
-// --- CONNEXION (ENVOI DU CODE) ---
-app.post('/api/login', async (req, res) => {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ success: false, message: 'Email requis.' });
-
-    try {
-        const { data: user } = await supabase.from('users').select('id').eq('email', email).single();
-        if (!user) return res.status(404).json({ success: false, message: 'Compte introuvable.' });
-
-        const code = Math.floor(100000 + Math.random() * 900000).toString();
-        const expires = new Date(Date.now() + 15 * 60 * 1000).toISOString();
-
-        await supabase.from('users').update({ login_code: code, login_code_expires: expires }).eq('email', email);
-
-        await resend.emails.send({
-            from: 'TRINQ <onboarding@resend.dev>',
-            to: email, // ⚠️ DOIT ÊTRE TON EMAIL POUR QUE ÇA MARCHE EN MODE TEST
-            subject: 'Connexion TRINQ 🍺',
-            html: `<h2>Rebonjour !</h2><p>Ton code de connexion : <strong style="font-size:32px;">${code}</strong></p>`
-        });
-
-        res.json({ success: true, message: 'Code envoyé par email !' });
-    } catch (err) {
-        console.error("Erreur login:", err);
-        res.status(500).json({ success: false, message: 'Erreur lors de la connexion.' });
-    }
-});
-
-// --- VÉRIFICATION DU CODE A 6 CHIFFRES ---
-// --- VERIFICATION DU CODE ---
-app.post('/api/verify-login', async (req, res) => {
-    const { email, code } = req.body;
-    try {
-        const safeEmail = email.toLowerCase().trim();
-        const safeCode = code.trim();
-
-        // 1. On cherche SEULEMENT par email pour être sûr de trouver le compte
-        const { data: user, error } = await supabase.from('users').select('*').eq('email', safeEmail).maybeSingle();
-        
-        if (error) console.error("Erreur DB:", error);
-        if (!user) return res.status(401).json({ success: false, message: 'Compte introuvable.' });
-
-        // 2. On compare les codes en forçant le format texte (sécurité anti-bug Supabase)
-        if (String(user.login_code) !== String(safeCode)) {
-            return res.status(401).json({ success: false, message: 'Code incorrect.' });
-        }
-
-        // 3. On vérifie l'expiration
-        if (new Date(user.login_code_expires) < new Date()) {
-            return res.status(401).json({ success: false, message: 'Code expiré (plus de 15 min).' });
-        }
-
-        // 4. Tout est bon, on efface le code pour la sécurité
-        await supabase.from('users').update({ login_code: null, login_code_expires: null }).eq('email', safeEmail);
-        
-        res.json({ success: true, user: { email: user.email, is_vip: user.is_vip, username: user.username, score: user.score } });
-    } catch (err) { 
-        console.error("Erreur serveur verify-login:", err);
-        res.status(500).json({ success: false, message: 'Erreur interne.' }); 
-    }
-});
-
-// --- PAIEMENT STRIPE VIP ---
-app.post('/api/create-checkout-session', async (req, res) => {
-    try {
-        const session = await stripe.checkout.sessions.create({
-            payment_method_types: ['card'],
-            line_items: [{ price_data: { currency: 'eur', product_data: { name: 'Pass VIP TRINQ 💎' }, unit_amount: 500 }, quantity: 1 }],
-            mode: 'payment',
-            success_url: 'https://melodic-creponne-95434f.netlify.app/?success=true',
-            cancel_url: 'https://melodic-creponne-95434f.netlify.app/?canceled=true',
-        });
-        res.json({ url: session.url });
-    } catch (error) {
-        console.error('Erreur Stripe:', error);
-        res.status(500).json({ error: 'Erreur paiement.' });
-    }
-});
-
-// --- VERIFICATION DU CODE VIP TRINQ-XXXX ---
-// --- VERIFICATION DU CODE VIP (100% USAGE UNIQUE) ---
-app.post('/api/verify-vip', async (req, res) => {
-    const { code, email } = req.body; // On récupère l'email si le joueur est connecté
-    if (!code) return res.status(400).json({ success: false, message: 'Aucun code fourni.' });
-    
-    const cleanCode = code.trim().toUpperCase();
-
-    try {
-        // 1. MISE À JOUR ATOMIQUE : Empêche le multi-clic
-        // On demande à Supabase de mettre le statut 'active' UNIQUEMENT si le statut est encore 'pending'
-        const { data: updatedCode, error } = await supabase
-            .from('vip_codes')
-            .update({ status: 'active' })
-            .eq('code', cleanCode)
-            .eq('status', 'pending')
-            .select()
-            .maybeSingle();
-
-        // Si updatedCode est vide, ça veut dire que le code n'existait pas ou n'était plus "pending"
-        if (!updatedCode) {
-            return res.status(400).json({ success: false, message: 'Code invalide ou déjà utilisé par quelqu\'un d\'autre.' });
-        }
-
-        // 2. LIER LE VIP AU COMPTE (Si le joueur est connecté)
         if (email) {
-            const safeEmail = email.toLowerCase().trim();
-            await supabase.from('users').update({ is_vip: true }).eq('email', safeEmail);
+            await resend.emails.send({
+                from: 'TRINQ <noreply@trinq.be>',
+                to: email,
+                subject: '🎉 Ton code VIP TRINQ',
+                html: `<h2>Bienvenue dans le club !</h2><p>Ton code VIP : <strong>${vipCode}</strong></p><p>Active-le dans l'app TRINQ.</p>`
+            });
         }
-
-        res.json({ success: true, message: 'Pass VIP activé et lié à ton compte ! 🥂' });
-    } catch (err) {
-        console.error("Erreur VIP:", err);
-        res.status(500).json({ success: false, message: 'Erreur serveur.' });
     }
+    res.json({ received: true });
 });
 
-// --- AUTHENTIFICATION UNIQUE (MAGIC CODE) ---
-app.post('/api/auth', async (req, res) => {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ success: false, message: 'Email requis.' });
-    
-    try {
-        const safeEmail = email.toLowerCase().trim();
-        const code = Math.floor(100000 + Math.random() * 900000).toString();
-        const expires = new Date(Date.now() + 15 * 60 * 1000).toISOString();
-
-        // 1. Chercher si l'utilisateur existe
-        let { data: user, error: searchError } = await supabase.from('users').select('id').eq('email', safeEmail).maybeSingle();
-        if (searchError) throw searchError;
-
-        // 2. Créer OU Mettre à jour (avec blocage si la base de données refuse !)
-        if (!user) {
-            const { error: insertError } = await supabase.from('users').insert([{ email: safeEmail, login_code: code, login_code_expires: expires }]);
-            if (insertError) throw insertError; // CRUCIAL : Stoppe tout si Supabase refuse
-        } else {
-            const { error: updateError } = await supabase.from('users').update({ login_code: code, login_code_expires: expires }).eq('email', safeEmail);
-            if (updateError) throw updateError;
-        }
-
-        // 3. Envoyer l'email SEULEMENT SI la base de données a bien enregistré le code
-        await resend.emails.send({
-            from: 'TRINQ <onboarding@resend.dev>',
-            to: safeEmail, 
-            subject: 'Code Connexion TRINQ 🍺',
-            html: `<h2>Connexion TRINQ</h2><p>Ton code secret : <strong style="font-size:32px;">${code}</strong></p>`
-        });
-        
-        res.json({ success: true, message: 'Code envoyé !' });
-    } catch (err) { 
-        console.error("Erreur serveur auth:", err);
-        res.status(500).json({ success: false, message: "Erreur Base de données. Vérifie Railway !" }); 
-    }
-});
-
-// --- SET USERNAME ---
 app.post('/api/set-username', async (req, res) => {
     const { email, username } = req.body;
-    try {
-        await supabase.from('users').update({ username }).eq('email', email);
-        res.json({ success: true, username });
-    } catch (err) { res.status(500).json({ success: false }); }
+    const { error } = await supabase.from('users').update({ username }).eq('email', email);
+    if (error) return res.status(500).json({ success: false });
+    res.json({ success: true });
 });
 
-// --- LEADERBOARD ---
 app.get('/api/leaderboard', async (req, res) => {
-    try {
-        const { data } = await supabase.from('users').select('username, score, is_vip').not('username', 'is', null).order('score', { ascending: false }).limit(10);
-        res.json({ success: true, leaderboard: data });
-    } catch (err) { res.status(500).json({ success: false }); }
+    const { data, error } = await supabase.from('users').select('username, score, is_vip').order('score', { ascending: false }).limit(10);
+    if (error) return res.status(500).json({ error });
+    res.json(data);
 });
 
-// --- AJOUTER DES POINTS ---
 app.post('/api/add-score', async (req, res) => {
     const { email, points } = req.body;
-    try {
-        const { data } = await supabase.from('users').select('score').eq('email', email).single();
-        if (data) await supabase.from('users').update({ score: (data.score || 0) + points }).eq('email', email);
-        res.json({ success: true });
-    } catch (err) { res.status(500).json({ success: false }); }
+    const { data: user } = await supabase.from('users').select('score').eq('email', email).single();
+    const newScore = (user?.score || 0) + points;
+    await supabase.from('users').update({ score: newScore }).eq('email', email);
+    res.json({ success: true, score: newScore });
 });
 
-// --- CLOUD SYNC UP (Sauvegarder vers Supabase) ---
 app.post('/api/sync-up', async (req, res) => {
     const { email, history, favorites } = req.body;
-    try {
-        await supabase.from('users').update({ history, favorites }).eq('email', email);
-        res.json({ success: true });
-    } catch (err) { res.status(500).json({ success: false }); }
+    const { error } = await supabase.from('users').update({ history, favorites }).eq('email', email);
+    if (error) return res.status(500).json({ success: false });
+    res.json({ success: true });
 });
 
-// --- CLOUD SYNC DOWN (Récupérer depuis Supabase) ---
 app.post('/api/sync-down', async (req, res) => {
     const { email } = req.body;
-    try {
-        const { data } = await supabase.from('users').select('history, favorites').eq('email', email).maybeSingle();
-        res.json({ success: true, data });
-    } catch (err) { res.status(500).json({ success: false }); }
+    const { data, error } = await supabase.from('users').select('history, favorites').eq('email', email).single();
+    if (error) return res.status(500).json({ success: false });
+    res.json({ success: true, data });
 });
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Serveur TRINQ démarré sur le port ${PORT}`));
+
+app.get('/api/debug-db', async (req, res) => {
+    const { data, error } = await supabase.from('users').select('email, username, score, is_vip').limit(5);
+    if (error) return res.status(500).json({ error });
+    res.json(data);
+});
+
+/* =========================================
+   DÉMARRAGE
+   ========================================= */
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`🚀 TRINQ backend running on port ${PORT}`));
