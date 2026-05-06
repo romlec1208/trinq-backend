@@ -166,14 +166,23 @@ app.use((req, res, next) => {
 
 app.post('/api/verify-login', async (req, res) => {
     const { email, code } = req.body;
+    console.log("🔵 /api/verify-login appelé");
+    console.log("🔵 Email reçu :", email);
+    console.log("🔵 Code reçu :", code, "Type:", typeof code);
+    
     const { data: user } = await supabase.from('users').select('*').eq('email', email).single();
-
+    
+    console.log("🔵 Utilisateur trouvé :", user?.email);
+    console.log("🔵 Code en DB :", user?.auth_code, "Type:", typeof user?.auth_code);
+    console.log("🔵 Comparaison :", code, "===", user?.auth_code, "?", code === user?.auth_code);
+    
     if (!user || user.auth_code !== code) return res.json({ success: false, message: 'Code incorrect' });
     if (new Date() > new Date(user.auth_expires)) return res.json({ success: false, message: 'Code expiré' });
 
     await supabase.from('users').update({ auth_code: null, auth_expires: null }).eq('email', email);
     res.json({ success: true, user: { email: user.email, username: user.username, score: user.score, is_vip: user.is_vip } });
 });
+
 
 app.post('/api/verify-vip', async (req, res) => {
     const { code, email } = req.body;
@@ -227,7 +236,7 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, 
 
         if (email) {
             await resend.emails.send({
-                from: 'TRINQ <noreply@trinq.be>',
+                from: 'TRINQ <onboarding@resend.dev>',
                 to: email,
                 subject: '🎉 Ton code VIP TRINQ',
                 html: `<h2>Bienvenue dans le club !</h2><p>Ton code VIP : <strong>${vipCode}</strong></p><p>Active-le dans l'app TRINQ.</p>`
