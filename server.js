@@ -163,32 +163,6 @@ app.use((req, res, next) => {
 /* =========================================
    ROUTES API
    ========================================= */
-app.post('/api/auth', async (req, res) => {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ success: false, message: 'Email requis' });
-
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-
-    const { data: existingUser } = await supabase.from('users').select('email').eq('email', email).single();
-    if (!existingUser) {
-        await supabase.from('users').insert([{ email, score: 0, is_vip: false }]);
-    }
-
-    await supabase.from('users').update({ auth_code: code, auth_expires: expiresAt }).eq('email', email);
-
-    try {
-        await resend.emails.send({
-            from: 'TRINQ <noreply@trinq.be>',
-            to: email,
-            subject: '🍺 Ton code de connexion TRINQ',
-            html: `<h2>Ton code : <strong>${code}</strong></h2><p>Valable 10 minutes.</p>`
-        });
-        res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ success: false, message: 'Erreur envoi email' });
-    }
-});
 
 app.post('/api/verify-login', async (req, res) => {
     const { email, code } = req.body;
@@ -325,7 +299,7 @@ app.post('/api/auth', async (req, res) => {
     try {
         console.log("📧 ENVOI EMAIL À :", email);
         const response = await resend.emails.send({
-            from: 'TRINQ <noreply@trinq.be>',
+            from: 'TRINQ <onboarding@resend.dev>',
             to: email,
             subject: '🍺 Ton code de connexion TRINQ',
             html: `<h2>Ton code : <strong>${code}</strong></h2><p>Valable 10 minutes.</p>`
