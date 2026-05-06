@@ -175,21 +175,38 @@ app.post('/api/create-checkout-session', async (req, res) => {
 });
 
 // --- VERIFICATION DU CODE VIP TRINQ-XXXX ---
+// --- VERIFICATION DU CODE VIP (100% USAGE UNIQUE) ---
 app.post('/api/verify-vip', async (req, res) => {
-    const { code } = req.body;
+    const { code, email } = req.body; // On récupère l'email si le joueur est connecté
     if (!code) return res.status(400).json({ success: false, message: 'Aucun code fourni.' });
+    
     const cleanCode = code.trim().toUpperCase();
 
     try {
-        const { data, error } = await supabase.from('vip_codes').select('*').eq('code', cleanCode).single();
+        // 1. MISE À JOUR ATOMIQUE : Empêche le multi-clic
+        // On demande à Supabase de mettre le statut 'active' UNIQUEMENT si le statut est encore 'pending'
+        const { data: updatedCode, error } = await supabase
+            .from('vip_codes')
+            .update({ status: 'active' })
+            .eq('code', cleanCode)
+            .eq('status', 'pending')
+            .select()
+            .maybeSingle();
 
-        if (error || !data) return res.status(404).json({ success: false, message: 'Code invalide ou introuvable.' });
-        if (data.status === 'active') return res.status(400).json({ success: false, message: 'Code déjà utilisé.' });
-        if (data.status === 'revoked') return res.status(400).json({ success: false, message: 'Code révoqué.' });
+        // Si updatedCode est vide, ça veut dire que le code n'existait pas ou n'était plus "pending"
+        if (!updatedCode) {
+            return res.status(400).json({ success: false, message: 'Code invalide ou déjà utilisé par quelqu\'un d\'autre.' });
+        }
 
-        await supabase.from('vip_codes').update({ status: 'active' }).eq('code', cleanCode);
-        res.json({ success: true, message: 'Pass VIP activé ! 🥂' });
+        // 2. LIER LE VIP AU COMPTE (Si le joueur est connecté)
+        if (email) {
+            const safeEmail = email.toLowerCase().trim();
+            await supabase.from('users').update({ is_vip: true }).eq('email', safeEmail);
+        }
+
+        res.json({ success: true, message: 'Pass VIP activé et lié à ton compte ! 🥂' });
     } catch (err) {
+        console.error("Erreur VIP:", err);
         res.status(500).json({ success: false, message: 'Erreur serveur.' });
     }
 });
